@@ -7,7 +7,7 @@ Mesa de ayuda en AWS que reemplaza la atención por correo. El usuario reporta u
 | Campo | Valor |
 |---|---|
 | Proyecto | 10 — Turnos y cola de soporte TI |
-| Integrantes | Manuela Carmona Palacio ([código]) · Valeria Buriticá ([código]) · Karen Julieth Castaño Trujillo ([código]) |
+| Integrantes | Manuela Carmona Palacio ([1054858286]) · Valeria Buriticá ([1055754781]) · Karen Julieth Castaño Trujillo ([1055752702]) |
 | URL demo | [pegar el Output `SitioWebUrl` del stack] |
 | Instancia (versión Docker + Jenkins) | [pegar `http://<IP o DNS público de la EC2>`] |
 | Costo mensual real | USD [valor de Cost Explorer] (estimado: ≈ USD 0,9 · objetivo: USD 10) |
