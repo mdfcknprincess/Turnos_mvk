@@ -1,0 +1,10 @@
+# El contexto de construccion solo necesita app/server.py y frontend/index.html
+.git
+.github
+docs
+iac
+scripts
+tests
+*.md
+**/__pycache__
+**/*.db

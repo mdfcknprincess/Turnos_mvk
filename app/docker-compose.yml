@@ -1,5 +1,15 @@
+# Levanta la version 1 (la que despliega Jenkins en la instancia EC2 del proyecto).
+#   cd app && docker compose up -d --build      -> http://<ip-de-la-instancia>   (puerto 80)
+# El contexto de construccion es la raiz del repo porque la imagen incluye frontend/index.html.
 services:
   app:
-    build: .
-    ports: ["8000:8000"]
+    build:
+      context: ..
+      dockerfile: app/Dockerfile
+    image: gtn-app
+    ports: ["80:8080"]
+    volumes:
+      - datos:/data
     restart: unless-stopped
+volumes:
+  datos:

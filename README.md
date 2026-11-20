@@ -1,4 +1,4 @@
-# 🏷️ TURNOS MVK — Proyecto 10: Turnos y cola de soporte TI
+# 🏷️ [NOMBRE DEL EQUIPO] — Proyecto 10: Turnos y cola de soporte TI
 
 > Curso **GTN-2026-2** · Gestión de Tecnologías en la Nube
 
@@ -7,7 +7,7 @@ Mesa de ayuda en AWS que reemplaza la atención por correo. El usuario reporta u
 | Campo | Valor |
 |---|---|
 | Proyecto | 10 — Turnos y cola de soporte TI |
-| Integrantes | Manuela Carmona Palacio (1054858286) · Valeria Buriticá ([código]) · Karen Julieth Castaño Trujillo ([1055752702]) |
+| Integrantes | Manuela Carmona Palacio ([código]) · Valeria Buriticá ([código]) · Karen Julieth Castaño Trujillo ([código]) |
 | URL demo | [pegar el Output `SitioWebUrl` del stack] |
 | Instancia (versión Docker + Jenkins) | [pegar `http://<IP o DNS público de la EC2>`] |
 | Costo mensual real | USD [valor de Cost Explorer] (estimado: ≈ USD 0,9 · objetivo: USD 10) |
@@ -97,4 +97,3 @@ Resultados y capturas: [docs/pruebas.md](docs/pruebas.md) · evidencias de hitos
 | 11–12 | Automatización | [`iac/main.yaml`](iac/main.yaml), [`Jenkinsfile`](Jenkinsfile), [`.github/workflows/`](.github/workflows/) |
 | 13–14 | Seguridad y costos | [docs/seguridad.md](docs/seguridad.md), [docs/costos.md](docs/costos.md) |
 | 16 | Cierre | [docs/presentacion.pdf](docs/presentacion.pdf), [docs/pruebas.md](docs/pruebas.md) |
-

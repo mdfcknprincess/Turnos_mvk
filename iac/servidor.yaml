@@ -1,0 +1,116 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Proyecto 10 - Turnos y cola de soporte TI (GTN-2026-2). VERSION 1, hito "Servicio en linea":
+  un servidor propio (EC2) que clona el repo, construye la imagen Docker de app/ y la ejecuta.
+  La arquitectura final (serverless) esta en main.yaml; este stack es opcional y se puede apagar.
+
+Parameters:
+  Equipo:
+    Type: String
+    Description: Nombre del equipo (minusculas, sin espacios)
+    AllowedPattern: '^[a-z0-9-]{2,20}$'
+    Default: equipo
+  Proyecto:
+    Type: String
+    Description: Numero del enunciado
+    Default: '10'
+  Ambiente:
+    Type: String
+    AllowedValues: [lab, dev, prod]
+    Default: lab
+  RepoUrl:
+    Type: String
+    Description: URL https del repositorio (publico) que contiene app/Dockerfile, por ejemplo https://github.com/usuario/repo.git
+    AllowedPattern: '^https://[A-Za-z0-9._~:/@%+-]+$'
+  Rama:
+    Type: String
+    Description: Rama del repositorio que se despliega
+    AllowedPattern: '^[\w./-]+$'
+    Default: main
+  TipoInstancia:
+    Type: String
+    Description: Tamano del servidor (t3.micro = 2 vCPU, 1 GB de memoria)
+    AllowedValues: [t3.micro, t3.small, t2.micro]
+    Default: t3.micro
+  ImagenAmi:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Description: Amazon Linux 2023 mas reciente (se resuelve sola; no hace falta cambiarla)
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+  PerfilInstancia:
+    Type: String
+    Description: (Opcional) perfil de instancia para entrar por Session Manager. En AWS Academy es LabInstanceProfile
+    Default: ''
+
+Conditions:
+  ConPerfil: !Not [!Equals [!Ref PerfilInstancia, '']]
+
+Resources:
+  # ------------------------------------------------------------- RED
+  # Se usa la VPC por defecto de la cuenta. El unico puerto abierto es el 80 (pagina y API).
+  # No se abre SSH (22): para diagnosticar se usa Session Manager o el log de consola.
+  GrupoSeguridad:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Mesa de Soporte TI v1 - solo HTTP entrante
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: Pagina web y API
+      Tags:
+        - {Key: Curso, Value: GTN-2026-2}
+        - {Key: Equipo, Value: !Ref Equipo}
+        - {Key: Proyecto, Value: !Ref Proyecto}
+        - {Key: Ambiente, Value: !Ref Ambiente}
+
+  # --------------------------------------------------------- COMPUTO
+  Servidor:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref ImagenAmi
+      InstanceType: !Ref TipoInstancia
+      IamInstanceProfile: !If [ConPerfil, !Ref PerfilInstancia, !Ref 'AWS::NoValue']
+      SecurityGroupIds:
+        - !GetAtt GrupoSeguridad.GroupId
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 8
+            VolumeType: gp3
+            Encrypted: true
+            DeleteOnTermination: true
+      PropagateTagsToVolumeOnCreation: true
+      Tags:
+        - {Key: Name, Value: !Ref 'AWS::StackName'}
+        - {Key: Curso, Value: GTN-2026-2}
+        - {Key: Equipo, Value: !Ref Equipo}
+        - {Key: Proyecto, Value: !Ref Proyecto}
+        - {Key: Ambiente, Value: !Ref Ambiente}
+      # Al arrancar: instala Docker, clona el repo, construye la imagen y ejecuta el contenedor.
+      # El resultado queda en /var/log/cloud-init-output.log y en el log de consola de la instancia.
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          dnf install -y docker git
+          systemctl enable --now docker
+          git clone --depth 1 --branch '${Rama}' '${RepoUrl}' /opt/soporte-ti
+          cd /opt/soporte-ti
+          docker build -f app/Dockerfile -t soporte-ti .
+          docker run -d --name soporte-ti --restart unless-stopped -p 80:8080 -v soporte-datos:/data soporte-ti
+          echo "Mesa de Soporte TI v1 en marcha"
+
+Outputs:
+  Url:
+    Description: Pagina de la version 1 (tarda unos minutos en responder, mientras el servidor construye la imagen)
+    Value: !Sub 'http://${Servidor.PublicDnsName}'
+  InstanciaId:
+    Description: Identificador del servidor
+    Value: !Ref Servidor
+  VerLogDeArranque:
+    Description: Comando para ver que hizo el servidor al arrancar
+    Value: !Sub 'aws ec2 get-console-output --instance-id ${Servidor} --latest --output text'
+  Detener:
+    Description: Comando para apagar el servidor sin borrarlo (deja de cobrar computo)
+    Value: !Sub 'aws ec2 stop-instances --instance-ids ${Servidor}'

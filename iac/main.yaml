@@ -1,51 +1,960 @@
-AWSTemplateFormatVersion: "2010-09-09"
-Description: >
-  Plantilla inicial — GTN 2026-2. Reemplaza/amplía: este ejemplo crea red básica
-  y un bucket con los tags obligatorios. Organiza el proyecto en capas si crece.
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Proyecto 10 - Turnos y cola de soporte TI (GTN-2026-2).
+  Serverless: API Gateway HTTP + Lambda + SQS + DynamoDB + SNS + EventBridge.
+  Capas: datos -> mensajeria -> computo -> API -> frontend -> observabilidad.
+
+# ===== PARAMETROS =====
 Parameters:
+  Equipo:
+    Type: String
+    Description: Nombre del equipo (minusculas, sin espacios). Se usa en tags y nombres.
+    AllowedPattern: '^[a-z0-9-]{2,20}$'
+    Default: equipo
+  Proyecto:
+    Type: String
+    Description: Numero del enunciado
+    Default: '10'
   Ambiente:
     Type: String
+    AllowedValues: [lab, dev, prod]
     Default: lab
-    AllowedValues: [lab, prod]
-  NombreEquipo:
+  EmailJefe:
     Type: String
-    Description: nombre corto del equipo (aparece en los nombres de recursos)
+    Description: Correo del jefe de soporte (recibe alertas de SLA). Debe confirmar la suscripcion.
+    AllowedPattern: '^[^@\s]+@[^@\s]+\.[^@\s]+$'
+    Default: jefe@example.com   # marcador: con este valor no se suscribe a nadie
+  SlaHoras:
+    Type: Number
+    Description: Horas maximas que un ticket puede estar PENDIENTE antes de alertar al jefe
+    Default: 24
+    MinValue: 1
+  CrearRolesIam:
+    Type: String
+    Description: >-
+      true = el stack crea un rol IAM de minimo privilegio por cada funcion.
+      false = todas las funciones usan RolExistente (cuentas AWS Academy, que no dejan crear roles).
+    AllowedValues: ['true', 'false']
+    Default: 'true'
+  RolExistente:
+    Type: String
+    Description: Nombre del rol que usan las funciones cuando CrearRolesIam=false (en AWS Academy es LabRole)
+    AllowedPattern: '^[\w+=,.@-]{1,64}$'
+    Default: LabRole
+  CrearSitioWeb:
+    Type: String
+    Description: Crear bucket S3 publico para el frontend (false si la cuenta bloquea buckets publicos)
+    AllowedValues: ['true', 'false']
+    Default: 'true'
+
+Conditions:
+  CrearRoles: !Equals [!Ref CrearRolesIam, 'true']
+  ConSitioWeb: !Equals [!Ref CrearSitioWeb, 'true']
+  ConEmailJefe: !Not [!Equals [!Ref EmailJefe, 'jefe@example.com']]
+
 Resources:
-  VPC:
-    Type: AWS::EC2::VPC
+  # ===== CAPA DE DATOS =====
+  TablaTickets:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
     Properties:
-      CidrBlock: 10.0.0.0/16
-      EnableDnsSupport: true
-      EnableDnsHostnames: true
-      Tags:
-        - {Key: Curso, Value: GTN-2026-2}
-        - {Key: Equipo, Value: !Ref NombreEquipo}
-        - {Key: Ambiente, Value: !Ref Ambiente}
-  SubnetPublica:
-    Type: AWS::EC2::Subnet
+      TableName: !Sub '${AWS::StackName}-tickets'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: ticketId, AttributeType: S}
+        - {AttributeName: estado, AttributeType: S}
+        - {AttributeName: creadoEn, AttributeType: S}
+        - {AttributeName: email, AttributeType: S}
+      KeySchema:
+        - {AttributeName: ticketId, KeyType: HASH}
+      GlobalSecondaryIndexes:
+        - IndexName: porEstado          # la "cola" que ve el agente, ordenada FIFO por creadoEn
+          KeySchema:
+            - {AttributeName: estado, KeyType: HASH}
+            - {AttributeName: creadoEn, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+        - IndexName: porEmail           # "mis tickets" del usuario
+          KeySchema:
+            - {AttributeName: email, KeyType: HASH}
+            - {AttributeName: creadoEn, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES   # dispara notificaciones al cambiar estado
+      Tags: [{Key: Curso, Value: GTN-2026-2}, {Key: Equipo, Value: !Ref Equipo}, {Key: Proyecto, Value: !Ref Proyecto}, {Key: Ambiente, Value: !Ref Ambiente}]
+
+  # ===== CAPA DE MENSAJERIA (cola asincronica + notificaciones) =====
+  ColaTicketsDLQ:
+    Type: AWS::SQS::Queue
     Properties:
-      VpcId: !Ref VPC
-      CidrBlock: 10.0.1.0/24
-      MapPublicIpOnLaunch: true
-      AvailabilityZone: !Select [0, !GetAZs ""]
-      Tags:
-        - {Key: Curso, Value: GTN-2026-2}
-        - {Key: Equipo, Value: !Ref NombreEquipo}
-  BucketDatos:
+      QueueName: !Sub '${AWS::StackName}-tickets-dlq'
+      MessageRetentionPeriod: 1209600   # 14 dias para investigar fallos
+      SqsManagedSseEnabled: true
+      Tags: [{Key: Curso, Value: GTN-2026-2}, {Key: Equipo, Value: !Ref Equipo}, {Key: Proyecto, Value: !Ref Proyecto}, {Key: Ambiente, Value: !Ref Ambiente}]
+
+  ColaTickets:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-tickets'
+      VisibilityTimeout: 60             # >= 6x timeout del worker
+      MessageRetentionPeriod: 345600    # 4 dias
+      ReceiveMessageWaitTimeSeconds: 20 # long polling = menos requests = menos costo
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ColaTicketsDLQ.Arn
+        maxReceiveCount: 3
+      Tags: [{Key: Curso, Value: GTN-2026-2}, {Key: Equipo, Value: !Ref Equipo}, {Key: Proyecto, Value: !Ref Proyecto}, {Key: Ambiente, Value: !Ref Ambiente}]
+
+  TopicUsuarios:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-notif-usuarios'
+      DisplayName: Soporte TI
+      Tags: [{Key: Curso, Value: GTN-2026-2}, {Key: Equipo, Value: !Ref Equipo}, {Key: Proyecto, Value: !Ref Proyecto}, {Key: Ambiente, Value: !Ref Ambiente}]
+
+  TopicJefe:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-alertas-jefe'
+      DisplayName: Soporte TI SLA
+      Subscription: !If [ConEmailJefe, [{Protocol: email, Endpoint: !Ref EmailJefe}], !Ref 'AWS::NoValue']
+      Tags: [{Key: Curso, Value: GTN-2026-2}, {Key: Equipo, Value: !Ref Equipo}, {Key: Proyecto, Value: !Ref Proyecto}, {Key: Ambiente, Value: !Ref Ambiente}]
+
+  # ===== SEGURIDAD: un rol IAM por funcion, cada uno con el minimo privilegio (auditoria completa en docs/seguridad.md) =====
+  # crear-ticket: solo puede ENVIAR mensajes a la cola de tickets
+  RolCrearTicket:
+    Type: AWS::IAM::Role
+    Condition: CrearRoles
+    Properties:
+      AssumeRolePolicyDocument: {Version: '2012-10-17', Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: sts:AssumeRole}]}
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: enviar-a-cola
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - {Effect: Allow, Action: sqs:SendMessage, Resource: !GetAtt ColaTickets.Arn}
+      Tags: [{Key: Curso, Value: GTN-2026-2}, {Key: Equipo, Value: !Ref Equipo}, {Key: Proyecto, Value: !Ref Proyecto}, {Key: Ambiente, Value: !Ref Ambiente}]
+
+  # worker: consume la cola, CREA tickets y suscribe correos (no puede leer ni modificar tickets)
+  RolWorker:
+    Type: AWS::IAM::Role
+    Condition: CrearRoles
+    Properties:
+      AssumeRolePolicyDocument: {Version: '2012-10-17', Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: sts:AssumeRole}]}
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: consumir-cola-y-guardar
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes]
+                Resource: !GetAtt ColaTickets.Arn
+              - {Effect: Allow, Action: dynamodb:PutItem, Resource: !GetAtt TablaTickets.Arn}
+              - {Effect: Allow, Action: sns:Subscribe, Resource: !Ref TopicUsuarios}
+      Tags: [{Key: Curso, Value: GTN-2026-2}, {Key: Equipo, Value: !Ref Equipo}, {Key: Proyecto, Value: !Ref Proyecto}, {Key: Ambiente, Value: !Ref Ambiente}]
+
+  # consultas: SOLO LECTURA de la tabla y sus indices
+  RolConsultas:
+    Type: AWS::IAM::Role
+    Condition: CrearRoles
+    Properties:
+      AssumeRolePolicyDocument: {Version: '2012-10-17', Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: sts:AssumeRole}]}
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: leer-tickets
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:Query, dynamodb:Scan]
+                Resource:
+                  - !GetAtt TablaTickets.Arn
+                  - !Sub '${TablaTickets.Arn}/index/*'
+      Tags: [{Key: Curso, Value: GTN-2026-2}, {Key: Equipo, Value: !Ref Equipo}, {Key: Proyecto, Value: !Ref Proyecto}, {Key: Ambiente, Value: !Ref Ambiente}]
+
+  # cambiar-estado: solo puede ACTUALIZAR tickets (no crear, leer en bloque ni borrar)
+  RolEstado:
+    Type: AWS::IAM::Role
+    Condition: CrearRoles
+    Properties:
+      AssumeRolePolicyDocument: {Version: '2012-10-17', Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: sts:AssumeRole}]}
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: actualizar-tickets
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - {Effect: Allow, Action: dynamodb:UpdateItem, Resource: !GetAtt TablaTickets.Arn}
+      Tags: [{Key: Curso, Value: GTN-2026-2}, {Key: Equipo, Value: !Ref Equipo}, {Key: Proyecto, Value: !Ref Proyecto}, {Key: Ambiente, Value: !Ref Ambiente}]
+
+  # notificar: lee el stream de cambios y publica SOLO en el topic de usuarios
+  RolNotificar:
+    Type: AWS::IAM::Role
+    Condition: CrearRoles
+    Properties:
+      AssumeRolePolicyDocument: {Version: '2012-10-17', Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: sts:AssumeRole}]}
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: leer-stream-y-notificar
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetRecords, dynamodb:GetShardIterator, dynamodb:DescribeStream, dynamodb:ListStreams]
+                Resource: !Sub '${TablaTickets.Arn}/stream/*'   # solo los streams de esta tabla
+              - {Effect: Allow, Action: sns:Publish, Resource: !Ref TopicUsuarios}
+      Tags: [{Key: Curso, Value: GTN-2026-2}, {Key: Equipo, Value: !Ref Equipo}, {Key: Proyecto, Value: !Ref Proyecto}, {Key: Ambiente, Value: !Ref Ambiente}]
+
+  # sla: consulta SOLO el indice porEstado, marca el ticket y publica SOLO en el topic del jefe
+  RolSla:
+    Type: AWS::IAM::Role
+    Condition: CrearRoles
+    Properties:
+      AssumeRolePolicyDocument: {Version: '2012-10-17', Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: sts:AssumeRole}]}
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: revisar-sla
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - {Effect: Allow, Action: dynamodb:Query, Resource: !Sub '${TablaTickets.Arn}/index/porEstado'}
+              - {Effect: Allow, Action: dynamodb:UpdateItem, Resource: !GetAtt TablaTickets.Arn}
+              - {Effect: Allow, Action: sns:Publish, Resource: !Ref TopicJefe}
+      Tags: [{Key: Curso, Value: GTN-2026-2}, {Key: Equipo, Value: !Ref Equipo}, {Key: Proyecto, Value: !Ref Proyecto}, {Key: Ambiente, Value: !Ref Ambiente}]
+
+  # semilla: solo puede escribir en lote los datos de prueba (corre una vez, al crear el stack)
+  RolSemilla:
+    Type: AWS::IAM::Role
+    Condition: CrearRoles
+    Properties:
+      AssumeRolePolicyDocument: {Version: '2012-10-17', Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: sts:AssumeRole}]}
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: cargar-datos-prueba
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - {Effect: Allow, Action: dynamodb:BatchWriteItem, Resource: !GetAtt TablaTickets.Arn}
+      Tags: [{Key: Curso, Value: GTN-2026-2}, {Key: Equipo, Value: !Ref Equipo}, {Key: Proyecto, Value: !Ref Proyecto}, {Key: Ambiente, Value: !Ref Ambiente}]
+
+  # ===== CAPA DE COMPUTO (Lambdas, codigo inline para desplegar con 1 comando) =====
+
+  # HU-01: el usuario crea un ticket -> se encola (respuesta 202, asincronico)
+  FnCrearTicket:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-crear-ticket'
+      Description: HU-01 recibe el ticket, lo valida y lo publica en SQS
+      Runtime: python3.12
+      Handler: index.handler
+      MemorySize: 128
+      Timeout: 10
+      Role: !If [CrearRoles, !GetAtt RolCrearTicket.Arn, !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${RolExistente}']
+      LoggingConfig:
+        LogGroup: !Ref LogsCrearTicket
+      Environment:
+        Variables:
+          QUEUE_URL: !Ref ColaTickets
+      Code:
+        ZipFile: |
+          import json, os, uuid, boto3
+          from datetime import datetime, timezone
+          sqs = boto3.client('sqs')
+          CATS = {'HARDWARE', 'SOFTWARE', 'RED', 'ACCESOS', 'OTRO'}
+          PRIO = {'BAJA', 'MEDIA', 'ALTA'}
+
+          def resp(code, body):
+              return {'statusCode': code, 'headers': {'Content-Type': 'application/json'},
+                      'body': json.dumps(body)}
+
+          def handler(event, context):
+              try:
+                  b = json.loads(event.get('body') or '{}')
+              except ValueError:
+                  return resp(400, {'error': 'El cuerpo debe ser un objeto JSON'})
+              if not isinstance(b, dict):
+                  return resp(400, {'error': 'El cuerpo debe ser un objeto JSON'})
+              txt = lambda k: str(b.get(k) or '').strip()
+              email, titulo, desc = txt('email').lower(), txt('titulo'), txt('descripcion')
+              if '@' not in email or not titulo or not desc:
+                  return resp(400, {'error': 'email, titulo y descripcion son obligatorios'})
+              ticket = {
+                  'ticketId': 'T-' + uuid.uuid4().hex[:8].upper(),
+                  'email': email[:120],
+                  'nombre': txt('nombre')[:80],
+                  'titulo': titulo[:120],
+                  'descripcion': desc[:2000],
+                  'categoria': txt('categoria') if txt('categoria') in CATS else 'OTRO',
+                  'prioridad': txt('prioridad') if txt('prioridad') in PRIO else 'MEDIA',
+                  'creadoEn': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+              }
+              sqs.send_message(QueueUrl=os.environ['QUEUE_URL'], MessageBody=json.dumps(ticket))
+              return resp(202, {'mensaje': 'Ticket recibido y en cola', 'ticketId': ticket['ticketId']})
+      Tags: [{Key: Curso, Value: GTN-2026-2}, {Key: Equipo, Value: !Ref Equipo}, {Key: Proyecto, Value: !Ref Proyecto}, {Key: Ambiente, Value: !Ref Ambiente}]
+
+  # Consumidor de la cola: persiste el ticket (idempotente) y suscribe al usuario a sus notificaciones
+  FnWorker:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-worker'
+      Description: Consume SQS, guarda en DynamoDB y suscribe el email del usuario (HU-05)
+      Runtime: python3.12
+      Handler: index.handler
+      MemorySize: 128
+      Timeout: 10
+      Role: !If [CrearRoles, !GetAtt RolWorker.Arn, !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${RolExistente}']
+      LoggingConfig:
+        LogGroup: !Ref LogsWorker
+      Environment:
+        Variables:
+          TABLE: !Ref TablaTickets
+          TOPIC_USUARIOS: !Ref TopicUsuarios
+      Code:
+        ZipFile: |
+          import json, os, boto3
+          tabla = boto3.resource('dynamodb').Table(os.environ['TABLE'])
+          sns = boto3.client('sns')
+          YaExiste = tabla.meta.client.exceptions.ConditionalCheckFailedException
+
+          def handler(event, context):
+              fallos = []
+              for r in event['Records']:
+                  try:
+                      t = json.loads(r['body'])
+                      t['estado'] = 'PENDIENTE'
+                      t['slaAlertado'] = False
+                      # Idempotencia: SQS entrega "al menos una vez"
+                      tabla.put_item(Item=t, ConditionExpression='attribute_not_exists(ticketId)')
+                  except YaExiste:
+                      print('Duplicado ignorado', r['messageId'])
+                      continue
+                  except Exception as e:
+                      print('ERROR', r['messageId'], e)
+                      fallos.append({'itemIdentifier': r['messageId']})
+                      continue
+                  email = t.get('email', '')
+                  if not email or email.endswith('@example.com'):
+                      continue  # dominio reservado para pruebas: nunca se le envia correo
+                  try:
+                      # Suscripcion con filtro: el usuario solo recibe correos de SUS tickets.
+                      # La primera vez SNS le envia un correo de confirmacion.
+                      sns.subscribe(TopicArn=os.environ['TOPIC_USUARIOS'], Protocol='email',
+                                    Endpoint=email,
+                                    Attributes={'FilterPolicy': json.dumps({'email': [email]})})
+                  except Exception as e:
+                      print('WARN suscripcion', email, e)
+              # Solo los mensajes fallidos vuelven a la cola (y tras 3 intentos a la DLQ)
+              return {'batchItemFailures': fallos}
+      Tags: [{Key: Curso, Value: GTN-2026-2}, {Key: Equipo, Value: !Ref Equipo}, {Key: Proyecto, Value: !Ref Proyecto}, {Key: Ambiente, Value: !Ref Ambiente}]
+
+  WorkerDesdeCola:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt ColaTickets.Arn
+      FunctionName: !Ref FnWorker
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 2   # espera hasta 2 s para juntar un lote
+      FunctionResponseTypes: [ReportBatchItemFailures]
+      ScalingConfig:
+        MaximumConcurrency: 2   # la cola absorbe picos; la BD recibe un ritmo controlado
+
+  # HU-02 / HU-04: consultas (cola, mis tickets, detalle) y metricas
+  FnConsultas:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-consultas'
+      Description: HU-02 cola de pendientes, mis tickets, detalle y HU-04 metricas
+      Runtime: python3.12
+      Handler: index.handler
+      MemorySize: 256
+      Timeout: 15
+      Role: !If [CrearRoles, !GetAtt RolConsultas.Arn, !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${RolExistente}']
+      LoggingConfig:
+        LogGroup: !Ref LogsConsultas
+      Environment:
+        Variables:
+          TABLE: !Ref TablaTickets
+          SLA_HORAS: !Ref SlaHoras
+      Code:
+        ZipFile: |
+          import json, os, boto3
+          from boto3.dynamodb.conditions import Key
+          from datetime import datetime, timezone
+          t = boto3.resource('dynamodb').Table(os.environ['TABLE'])
+          SLA = float(os.environ.get('SLA_HORAS', '24'))
+
+          def resp(c, b):
+              return {'statusCode': c, 'headers': {'Content-Type': 'application/json'},
+                      'body': json.dumps(b, default=str)}
+
+          def scan_all():
+              r = t.scan(); items = r['Items']
+              while 'LastEvaluatedKey' in r:
+                  r = t.scan(ExclusiveStartKey=r['LastEvaluatedKey']); items += r['Items']
+              return items
+
+          def horas(a, b):
+              return (datetime.fromisoformat(b) - datetime.fromisoformat(a)).total_seconds() / 3600
+
+          def prom(xs):
+              return round(sum(xs) / len(xs), 2) if xs else None
+
+          def metricas(items):
+              ahora = datetime.now(timezone.utc).isoformat(timespec='seconds')
+              esp, res, ag, est, venc = [], [], {}, {}, []
+              for i in items:
+                  est[i['estado']] = est.get(i['estado'], 0) + 1
+                  if i.get('tomadoEn'): esp.append(horas(i['creadoEn'], i['tomadoEn']))
+                  if i.get('resueltoEn'): res.append(horas(i['creadoEn'], i['resueltoEn']))
+                  if i.get('agente'):
+                      a = ag.setdefault(i['agente'], {'agente': i['agente'], 'asignados': 0, 'resueltos': 0, 'h': []})
+                      a['asignados'] += 1
+                      if i.get('resueltoEn'):
+                          a['resueltos'] += 1; a['h'].append(horas(i['tomadoEn'], i['resueltoEn']))
+                  if i['estado'] == 'PENDIENTE' and horas(i['creadoEn'], ahora) > SLA:
+                      venc.append({k: i[k] for k in ('ticketId', 'titulo', 'prioridad', 'creadoEn')})
+              for a in ag.values():
+                  a['horasPromResolucion'] = prom(a.pop('h'))
+              return {'total': len(items), 'porEstado': est, 'horasPromEspera': prom(esp),
+                      'horasPromResolucion': prom(res), 'slaHoras': SLA, 'slaVencidos': venc,
+                      'porAgente': sorted(ag.values(), key=lambda x: -x['asignados'])}
+
+          def handler(event, context):
+              ruta = event['routeKey']
+              q = event.get('queryStringParameters') or {}
+              if ruta == 'GET /tickets/{id}':
+                  it = t.get_item(Key={'ticketId': event['pathParameters']['id']}).get('Item')
+                  return resp(200, it) if it else resp(404, {'error': 'No existe'})
+              if ruta == 'GET /tickets':
+                  if q.get('estado'):   # cola FIFO: mas antiguo primero
+                      items = t.query(IndexName='porEstado',
+                                      KeyConditionExpression=Key('estado').eq(q['estado'].upper()))['Items']
+                  elif q.get('email'):
+                      items = t.query(IndexName='porEmail', ScanIndexForward=False,
+                                      KeyConditionExpression=Key('email').eq(q['email'].lower()))['Items']
+                  else:
+                      items = scan_all()
+                  if q.get('agente'):
+                      items = [i for i in items if i.get('agente') == q['agente']]
+                  return resp(200, items)
+              if ruta == 'GET /metricas':
+                  return resp(200, metricas(scan_all()))
+              return resp(404, {'error': 'Ruta no soportada'})
+      Tags: [{Key: Curso, Value: GTN-2026-2}, {Key: Equipo, Value: !Ref Equipo}, {Key: Proyecto, Value: !Ref Proyecto}, {Key: Ambiente, Value: !Ref Ambiente}]
+
+  # HU-02 (tomar) / HU-03 (resolver): transiciones de estado con control de concurrencia
+  FnEstado:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-cambiar-estado'
+      Description: HU-02 tomar ticket y HU-03 resolver, con escritura condicional
+      Runtime: python3.12
+      Handler: index.handler
+      MemorySize: 128
+      Timeout: 10
+      Role: !If [CrearRoles, !GetAtt RolEstado.Arn, !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${RolExistente}']
+      LoggingConfig:
+        LogGroup: !Ref LogsEstado
+      Environment:
+        Variables:
+          TABLE: !Ref TablaTickets
+      Code:
+        ZipFile: |
+          import json, os, boto3
+          from datetime import datetime, timezone
+          t = boto3.resource('dynamodb').Table(os.environ['TABLE'])
+          Conflicto = t.meta.client.exceptions.ConditionalCheckFailedException
+
+          def resp(c, b):
+              return {'statusCode': c, 'headers': {'Content-Type': 'application/json'},
+                      'body': json.dumps(b, default=str)}
+
+          def handler(event, context):
+              tid = event['pathParameters']['id']
+              try:
+                  b = json.loads(event.get('body') or '{}')
+              except ValueError:
+                  return resp(400, {'error': 'El cuerpo debe ser un objeto JSON'})
+              accion = b.get('accion')
+              agente = (b.get('agente') or '').strip().lower()
+              if not agente:
+                  return resp(400, {'error': 'agente es obligatorio'})
+              ahora = datetime.now(timezone.utc).isoformat(timespec='seconds')
+              try:
+                  if accion == 'tomar':
+                      # Solo se puede tomar si sigue PENDIENTE: dos agentes no toman el mismo ticket
+                      r = t.update_item(
+                          Key={'ticketId': tid},
+                          UpdateExpression='SET estado = :n, agente = :a, tomadoEn = :t',
+                          ConditionExpression='estado = :p',
+                          ExpressionAttributeValues={':n': 'EN_PROCESO', ':a': agente, ':t': ahora, ':p': 'PENDIENTE'},
+                          ReturnValues='ALL_NEW')
+                  elif accion == 'resolver':
+                      # Solo el agente asignado puede resolver un ticket EN_PROCESO
+                      r = t.update_item(
+                          Key={'ticketId': tid},
+                          UpdateExpression='SET estado = :n, resueltoEn = :t, solucion = :s',
+                          ConditionExpression='estado = :p AND agente = :a',
+                          ExpressionAttributeValues={':n': 'RESUELTO', ':t': ahora, ':p': 'EN_PROCESO',
+                                                     ':a': agente, ':s': (b.get('solucion') or 'Sin detalle')[:1000]},
+                          ReturnValues='ALL_NEW')
+                  else:
+                      return resp(400, {'error': "accion debe ser 'tomar' o 'resolver'"})
+              except Conflicto:
+                  return resp(409, {'error': 'No se pudo: el ticket ya fue tomado por otro agente, no es tuyo o no existe'})
+              return resp(200, r['Attributes'])
+      Tags: [{Key: Curso, Value: GTN-2026-2}, {Key: Equipo, Value: !Ref Equipo}, {Key: Proyecto, Value: !Ref Proyecto}, {Key: Ambiente, Value: !Ref Ambiente}]
+
+  # HU-05: cada cambio de estado en DynamoDB genera un correo al usuario duenno del ticket
+  FnNotificar:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-notificar'
+      Description: HU-05 lee DynamoDB Streams y publica en SNS con filtro por email
+      Runtime: python3.12
+      Handler: index.handler
+      MemorySize: 128
+      Timeout: 15
+      Role: !If [CrearRoles, !GetAtt RolNotificar.Arn, !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${RolExistente}']
+      LoggingConfig:
+        LogGroup: !Ref LogsNotificar
+      Environment:
+        Variables:
+          TOPIC_USUARIOS: !Ref TopicUsuarios
+      Code:
+        ZipFile: |
+          import os, boto3
+          sns = boto3.client('sns')
+          TXT = {'PENDIENTE': 'fue recibido: ya se encuentra en la cola de pendientes',
+                 'EN_PROCESO': 'fue tomado por un agente: ahora se encuentra EN PROCESO',
+                 'RESUELTO': 'fue RESUELTO'}
+
+          def v(img, k):
+              return list(img[k].values())[0] if k in img else None
+
+          def handler(event, context):
+              for r in event['Records']:
+                  if r['eventName'] not in ('INSERT', 'MODIFY'):
+                      continue
+                  new = r['dynamodb'].get('NewImage', {})
+                  old = r['dynamodb'].get('OldImage', {})
+                  est = v(new, 'estado')
+                  if r['eventName'] == 'MODIFY' and v(old, 'estado') == est:
+                      continue  # cambio que no es de estado (ej. marca de SLA)
+                  if not v(new, 'email'):
+                      continue
+                  tid, tit = v(new, 'ticketId'), v(new, 'titulo')
+                  msg = f'Hola,\n\nTu ticket {tid} "{tit}" {TXT.get(est, "pasa a " + str(est))}.'
+                  if v(new, 'agente'):
+                      msg += f'\nAgente asignado: {v(new, "agente")}'
+                  if v(new, 'solucion'):
+                      msg += f'\nRespuesta del agente: {v(new, "solucion")}'
+                  msg += '\n\n-- Mesa de Soporte TI'
+                  sns.publish(TopicArn=os.environ['TOPIC_USUARIOS'],
+                              Subject=f'[Soporte TI] Ticket {tid}: {est}'[:100], Message=msg,
+                              MessageAttributes={'email': {'DataType': 'String', 'StringValue': v(new, 'email')}})
+      Tags: [{Key: Curso, Value: GTN-2026-2}, {Key: Equipo, Value: !Ref Equipo}, {Key: Proyecto, Value: !Ref Proyecto}, {Key: Ambiente, Value: !Ref Ambiente}]
+
+  NotificarDesdeStream:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt TablaTickets.StreamArn
+      FunctionName: !Ref FnNotificar
+      StartingPosition: LATEST
+      BatchSize: 25
+      MaximumRetryAttempts: 2
+      BisectBatchOnFunctionError: true
+
+  # RETO EXTRA (SLA): cada hora busca tickets PENDIENTES > SlaHoras y alerta al jefe
+  FnSla:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-sla'
+      Description: Reto SLA - alerta al jefe por tickets sin atencion
+      Runtime: python3.12
+      Handler: index.handler
+      MemorySize: 128
+      Timeout: 30
+      Role: !If [CrearRoles, !GetAtt RolSla.Arn, !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${RolExistente}']
+      LoggingConfig:
+        LogGroup: !Ref LogsSla
+      Environment:
+        Variables:
+          TABLE: !Ref TablaTickets
+          TOPIC_JEFE: !Ref TopicJefe
+          SLA_HORAS: !Ref SlaHoras
+      Code:
+        ZipFile: |
+          import os, boto3
+          from boto3.dynamodb.conditions import Key
+          from datetime import datetime, timezone, timedelta
+          t = boto3.resource('dynamodb').Table(os.environ['TABLE'])
+          sns = boto3.client('sns')
+
+          def handler(event, context):
+              h = float(os.environ.get('SLA_HORAS', '24'))
+              limite = (datetime.now(timezone.utc) - timedelta(hours=h)).isoformat(timespec='seconds')
+              items = t.query(IndexName='porEstado',
+                              KeyConditionExpression=Key('estado').eq('PENDIENTE') & Key('creadoEn').lt(limite))['Items']
+              nuevos = [i for i in items if not i.get('slaAlertado')]   # no repetir alertas
+              if not nuevos:
+                  return {'alertados': 0}
+              lineas = [f"- {i['ticketId']} | {i.get('prioridad')} | {i['titulo']} | creado {i['creadoEn']}" for i in nuevos]
+              sns.publish(TopicArn=os.environ['TOPIC_JEFE'],
+                          Subject=f'[SLA] {len(nuevos)} ticket(s) superan {h:g}h sin ser atendidos'[:100],
+                          Message='Los siguientes tickets siguen PENDIENTES:\n\n' + '\n'.join(lineas))
+              for i in nuevos:
+                  t.update_item(Key={'ticketId': i['ticketId']}, UpdateExpression='SET slaAlertado = :v',
+                                ExpressionAttributeValues={':v': True})
+              return {'alertados': len(nuevos)}
+      Tags: [{Key: Curso, Value: GTN-2026-2}, {Key: Equipo, Value: !Ref Equipo}, {Key: Proyecto, Value: !Ref Proyecto}, {Key: Ambiente, Value: !Ref Ambiente}]
+
+  ReglaSlaCadaHora:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Revision horaria de SLA de tickets
+      ScheduleExpression: rate(1 hour)
+      State: ENABLED
+      Targets:
+        - {Arn: !GetAtt FnSla.Arn, Id: sla}
+
+  PermisoReglaSla:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref FnSla
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ReglaSlaCadaHora.Arn
+
+  # Datos de prueba (restriccion del enunciado): se cargan al crear el stack
+  FnSemilla:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-semilla'
+      Description: Carga datos de prueba al crear el stack
+      Runtime: python3.12
+      Handler: index.handler
+      MemorySize: 128
+      Timeout: 60
+      Role: !If [CrearRoles, !GetAtt RolSemilla.Arn, !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${RolExistente}']
+      LoggingConfig:
+        LogGroup: !Ref LogsSemilla
+      Environment:
+        Variables:
+          TABLE: !Ref TablaTickets
+      Code:
+        ZipFile: |
+          import os, time, boto3, cfnresponse
+          from datetime import datetime, timezone, timedelta
+          # (titulo, categoria, prioridad, email, creado hace h, tomado tras h, resuelto tras h, agente)
+          D = [
+           ('No enciende el computador', 'HARDWARE', 'ALTA', 'ana.gomez@example.com', 96, 1, 6, 'carlos'),
+           ('Clave de correo bloqueada', 'ACCESOS', 'MEDIA', 'luis.perez@example.com', 90, 0.5, 1, 'diana'),
+           ('Impresora piso 2 atascada', 'HARDWARE', 'BAJA', 'marta.ruiz@example.com', 80, 3, 8, 'carlos'),
+           ('VPN no conecta desde casa', 'RED', 'ALTA', 'jorge.diaz@example.com', 72, 0.2, 2, 'diana'),
+           ('Instalar Office en equipo nuevo', 'SOFTWARE', 'MEDIA', 'sofia.leon@example.com', 60, 4, 10, 'andres'),
+           ('Pantalla parpadea', 'HARDWARE', 'BAJA', 'ana.gomez@example.com', 50, 2, 20, 'andres'),
+           ('Sin acceso a carpeta compartida', 'ACCESOS', 'ALTA', 'pedro.mora@example.com', 40, 0.5, 1.5, 'carlos'),
+           ('Wifi lento en sala de juntas', 'RED', 'MEDIA', 'luis.perez@example.com', 30, 1, None, 'diana'),
+           ('Error al abrir el ERP', 'SOFTWARE', 'ALTA', 'marta.ruiz@example.com', 20, 0.3, None, 'carlos'),
+           ('Teclado con teclas pegadas', 'HARDWARE', 'BAJA', 'sofia.leon@example.com', 36, None, None, None),
+           ('Solicitud de segundo monitor', 'HARDWARE', 'BAJA', 'jorge.diaz@example.com', 28, None, None, None),
+           ('Antivirus vencido', 'SOFTWARE', 'MEDIA', 'pedro.mora@example.com', 5, None, None, None),
+           ('Crear usuario a nuevo empleado', 'ACCESOS', 'ALTA', 'rrhh@example.com', 2, None, None, None),
+           ('Videollamadas con cortes', 'RED', 'MEDIA', 'ana.gomez@example.com', 1, None, None, None),
+          ]
+
+          def cargar():
+              t = boto3.resource('dynamodb').Table(os.environ['TABLE'])
+              now = datetime.now(timezone.utc)
+              iso = lambda h: (now - timedelta(hours=h)).isoformat(timespec='seconds')
+              with t.batch_writer() as w:
+                  for n, (tit, cat, pr, em, c, tm, rs, ag) in enumerate(D, 1):
+                      it = {'ticketId': f'T-SEED{n:03d}', 'titulo': tit, 'categoria': cat,
+                            'descripcion': 'Dato de prueba: ' + tit, 'prioridad': pr, 'email': em,
+                            'nombre': em.split('@')[0], 'creadoEn': iso(c), 'estado': 'PENDIENTE',
+                            'slaAlertado': False}
+                      if tm is not None:
+                          it.update(estado='EN_PROCESO', agente=ag, tomadoEn=iso(c - tm))
+                      if rs is not None:
+                          it.update(estado='RESUELTO', resueltoEn=iso(c - rs), solucion='Resuelto (dato de prueba)')
+                      w.put_item(Item=it)
+
+          def handler(event, context):
+              # Lo invoca CloudFormation al crear el stack. Tambien se puede invocar a mano
+              # (aws lambda invoke) para restaurar los 14 tickets de prueba antes de una demo.
+              ok = True
+              if event.get('RequestType', 'Create') == 'Create':
+                  for intento in range(5):   # un permiso IAM recien creado puede tardar en aplicar
+                      try:
+                          cargar(); ok = True; break
+                      except Exception as e:
+                          print('intento', intento + 1, e); ok = False; time.sleep(5)
+              if 'ResponseURL' in event:
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS if ok else cfnresponse.FAILED, {})
+              return {'cargados': len(D) if ok else 0}
+      Tags: [{Key: Curso, Value: GTN-2026-2}, {Key: Equipo, Value: !Ref Equipo}, {Key: Proyecto, Value: !Ref Proyecto}, {Key: Ambiente, Value: !Ref Ambiente}]
+
+  CargarDatosPrueba:
+    Type: Custom::DatosPrueba
+    DependsOn: NotificarDesdeStream
+    Properties:
+      ServiceToken: !GetAtt FnSemilla.Arn
+      Version: '1'
+
+  # ===== CAPA DE API (HTTP API: ~70% mas barata que REST API) =====
+  Api:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${AWS::StackName}-api'
+      ProtocolType: HTTP
+      Description: API de tickets de soporte TI
+      CorsConfiguration:
+        AllowOrigins: ['*']
+        AllowMethods: [GET, POST, PATCH, OPTIONS]
+        AllowHeaders: [content-type]
+        MaxAge: 3600
+      Tags: {Curso: GTN-2026-2, Equipo: !Ref Equipo, Proyecto: !Ref Proyecto, Ambiente: !Ref Ambiente}
+
+  ApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref Api
+      StageName: $default
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 20   # tope de costo y proteccion ante abuso
+        ThrottlingRateLimit: 10
+      Tags: {Curso: GTN-2026-2, Equipo: !Ref Equipo, Proyecto: !Ref Proyecto, Ambiente: !Ref Ambiente}
+
+  IntegracionCrear:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref Api
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt FnCrearTicket.Arn
+      PayloadFormatVersion: '2.0'
+
+  IntegracionConsultas:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref Api
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt FnConsultas.Arn
+      PayloadFormatVersion: '2.0'
+
+  IntegracionEstado:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref Api
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt FnEstado.Arn
+      PayloadFormatVersion: '2.0'
+
+  RutaCrearTicket:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref Api
+      RouteKey: POST /tickets
+      Target: !Sub 'integrations/${IntegracionCrear}'
+
+  RutaListarTickets:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref Api
+      RouteKey: GET /tickets
+      Target: !Sub 'integrations/${IntegracionConsultas}'
+
+  RutaDetalleTicket:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref Api
+      RouteKey: GET /tickets/{id}
+      Target: !Sub 'integrations/${IntegracionConsultas}'
+
+  RutaMetricas:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref Api
+      RouteKey: GET /metricas
+      Target: !Sub 'integrations/${IntegracionConsultas}'
+
+  RutaCambiarEstado:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref Api
+      RouteKey: PATCH /tickets/{id}
+      Target: !Sub 'integrations/${IntegracionEstado}'
+
+  PermisoApiCrear:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref FnCrearTicket
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*'
+
+  PermisoApiConsultas:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref FnConsultas
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*'
+
+  PermisoApiEstado:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref FnEstado
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*'
+
+  # ===== FRONTEND (sitio estatico: el usuario no instala nada, solo abre una URL) =====
+  BucketSitio:
     Type: AWS::S3::Bucket
+    Condition: ConSitioWeb
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
     Properties:
-      BucketName: !Sub "gtn-2026-2-${NombreEquipo}-datos"
-      VersioningConfiguration: {Status: Enabled}
+      WebsiteConfiguration:
+        IndexDocument: index.html
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
-        BlockPublicPolicy: true
         IgnorePublicAcls: true
-        RestrictPublicBuckets: true
-      Tags:
-        - {Key: Curso, Value: GTN-2026-2}
-        - {Key: Equipo, Value: !Ref NombreEquipo}
-        - {Key: Proyecto, Value: proyecto-nn}
-        - {Key: Ambiente, Value: !Ref Ambiente}
+        BlockPublicPolicy: false
+        RestrictPublicBuckets: false
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      Tags: [{Key: Curso, Value: GTN-2026-2}, {Key: Equipo, Value: !Ref Equipo}, {Key: Proyecto, Value: !Ref Proyecto}, {Key: Ambiente, Value: !Ref Ambiente}]
+
+  PoliticaBucketSitio:
+    Type: AWS::S3::BucketPolicy
+    Condition: ConSitioWeb
+    Properties:
+      Bucket: !Ref BucketSitio
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: LecturaPublicaSoloSitio
+            Effect: Allow
+            Principal: '*'
+            Action: s3:GetObject
+            Resource: !Sub '${BucketSitio.Arn}/*'
+
+  # ===== OBSERVABILIDAD (alarma + tablero tecnico; las metricas de negocio estan en la vista Jefe) =====
+  # Un grupo de logs por funcion, declarado aqui para que tenga tags, se borre con el stack
+  # y no crezca sin limite: los registros se eliminan solos a los 14 dias.
+  # El nombre lo genera CloudFormation (empieza por el nombre del stack): asi nunca choca con
+  # un grupo que haya quedado de un despliegue anterior.
+  LogsCrearTicket:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 14
+      Tags: [{Key: Curso, Value: GTN-2026-2}, {Key: Equipo, Value: !Ref Equipo}, {Key: Proyecto, Value: !Ref Proyecto}, {Key: Ambiente, Value: !Ref Ambiente}]
+
+  LogsWorker:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 14
+      Tags: [{Key: Curso, Value: GTN-2026-2}, {Key: Equipo, Value: !Ref Equipo}, {Key: Proyecto, Value: !Ref Proyecto}, {Key: Ambiente, Value: !Ref Ambiente}]
+
+  LogsConsultas:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 14
+      Tags: [{Key: Curso, Value: GTN-2026-2}, {Key: Equipo, Value: !Ref Equipo}, {Key: Proyecto, Value: !Ref Proyecto}, {Key: Ambiente, Value: !Ref Ambiente}]
+
+  LogsEstado:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 14
+      Tags: [{Key: Curso, Value: GTN-2026-2}, {Key: Equipo, Value: !Ref Equipo}, {Key: Proyecto, Value: !Ref Proyecto}, {Key: Ambiente, Value: !Ref Ambiente}]
+
+  LogsNotificar:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 14
+      Tags: [{Key: Curso, Value: GTN-2026-2}, {Key: Equipo, Value: !Ref Equipo}, {Key: Proyecto, Value: !Ref Proyecto}, {Key: Ambiente, Value: !Ref Ambiente}]
+
+  LogsSla:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 14
+      Tags: [{Key: Curso, Value: GTN-2026-2}, {Key: Equipo, Value: !Ref Equipo}, {Key: Proyecto, Value: !Ref Proyecto}, {Key: Ambiente, Value: !Ref Ambiente}]
+
+  LogsSemilla:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 14
+      Tags: [{Key: Curso, Value: GTN-2026-2}, {Key: Equipo, Value: !Ref Equipo}, {Key: Proyecto, Value: !Ref Proyecto}, {Key: Ambiente, Value: !Ref Ambiente}]
+
+  # Si un ticket falla 3 veces y cae en la DLQ, el jefe recibe un correo (no depende de mirar el tablero)
+  AlarmaDLQ:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-mensajes-en-dlq'
+      AlarmDescription: Hay tickets que fallaron 3 veces y quedaron en la cola de mensajes fallidos (DLQ)
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - {Name: QueueName, Value: !GetAtt ColaTicketsDLQ.QueueName}
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref TopicJefe
+
+  DashboardOperacion:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${AWS::StackName}-operacion'
+      DashboardBody: !Sub |
+        {"widgets": [
+          {"type": "metric", "x": 0, "y": 0, "width": 12, "height": 6, "properties": {"title": "Cola de tickets (SQS)", "region": "${AWS::Region}", "stat": "Sum", "period": 300, "metrics": [["AWS/SQS", "NumberOfMessagesSent", "QueueName", "${ColaTickets.QueueName}"], [".", "NumberOfMessagesDeleted", ".", "."], [".", "ApproximateNumberOfMessagesVisible", ".", ".", {"stat": "Maximum"}]]}},
+          {"type": "metric", "x": 12, "y": 0, "width": 12, "height": 6, "properties": {"title": "Mensajes en la DLQ (fallos)", "region": "${AWS::Region}", "stat": "Maximum", "period": 300, "metrics": [["AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "${ColaTicketsDLQ.QueueName}"]]}},
+          {"type": "metric", "x": 0, "y": 6, "width": 12, "height": 6, "properties": {"title": "Peticiones a la API y errores", "region": "${AWS::Region}", "stat": "Sum", "period": 300, "metrics": [["AWS/ApiGateway", "Count", "ApiId", "${Api}"], [".", "4xx", ".", "."], [".", "5xx", ".", "."]]}},
+          {"type": "metric", "x": 12, "y": 6, "width": 12, "height": 6, "properties": {"title": "Errores de las funciones", "region": "${AWS::Region}", "stat": "Sum", "period": 300, "metrics": [["AWS/Lambda", "Errors", "FunctionName", "${FnCrearTicket}"], ["...", "${FnWorker}"], ["...", "${FnEstado}"], ["...", "${FnNotificar}"]]}}
+        ]}
+
+# ===== OUTPUTS =====
 Outputs:
-  VPCId: {Value: !Ref VPC}
-  BucketDatos: {Value: !Ref BucketDatos}
+  ApiUrl:
+    Description: URL base de la API
+    Value: !Sub 'https://${Api}.execute-api.${AWS::Region}.amazonaws.com'
+  SitioWebUrl:
+    Condition: ConSitioWeb
+    Description: URL del frontend (usuario / agente / jefe)
+    Value: !GetAtt BucketSitio.WebsiteURL
+  BucketSitio:
+    Condition: ConSitioWeb
+    Description: Bucket donde se sube el frontend
+    Value: !Ref BucketSitio
+  ColaUrl:
+    Description: Cola SQS de ingreso de tickets
+    Value: !Ref ColaTickets
+  DlqUrl:
+    Description: Dead Letter Queue
+    Value: !Ref ColaTicketsDLQ
+  TablaTickets:
+    Description: Tabla DynamoDB
+    Value: !Ref TablaTickets
+  TopicUsuarios:
+    Description: Topic SNS de notificaciones a usuarios
+    Value: !Ref TopicUsuarios
+  DashboardUrl:
+    Description: Dashboard de CloudWatch
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${AWS::StackName}-operacion'

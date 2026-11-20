@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mesa de Soporte TI</title>
+<link rel="icon" href="data:,">
+<script src="config.js"></script>
+<style>
+  :root { --bg:#f5f6f8; --card:#fff; --tx:#1d2330; --mut:#6b7280; --pri:#2457d6; --ok:#15803d; --warn:#b45309; --bad:#b91c1c; --bd:#e3e6eb; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; background:var(--bg); color:var(--tx); }
+  header { background:#111827; color:#fff; padding:14px 24px; display:flex; align-items:center; gap:24px; flex-wrap:wrap; }
+  header h1 { font-size:18px; margin:0; }
+  nav button { background:none; border:0; color:#cbd5e1; font-size:15px; padding:8px 12px; cursor:pointer; border-radius:6px; }
+  nav button.on { background:#2457d6; color:#fff; }
+  main { max-width:1100px; margin:24px auto; padding:0 16px; }
+  .card { background:var(--card); border:1px solid var(--bd); border-radius:10px; padding:20px; margin-bottom:18px; }
+  h2 { font-size:17px; margin:0 0 14px; }
+  label { display:block; font-size:13px; color:var(--mut); margin:10px 0 4px; }
+  input, select, textarea { width:100%; padding:9px 10px; border:1px solid var(--bd); border-radius:6px; font:inherit; }
+  textarea { min-height:90px; }
+  .row { display:grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap:12px; }
+  .btn { background:var(--pri); color:#fff; border:0; padding:9px 16px; border-radius:6px; cursor:pointer; font:inherit; margin-top:12px; }
+  .btn.sec { background:#e5e7eb; color:var(--tx); }
+  .btn.sm { padding:5px 10px; margin:0; font-size:13px; }
+  table { width:100%; border-collapse:collapse; font-size:14px; }
+  th, td { text-align:left; padding:8px 6px; border-bottom:1px solid var(--bd); vertical-align:top; }
+  th { color:var(--mut); font-weight:600; font-size:12px; text-transform:uppercase; }
+  .pill { display:inline-block; padding:2px 8px; border-radius:99px; font-size:12px; font-weight:600; }
+  .PENDIENTE { background:#fef3c7; color:var(--warn); } .EN_PROCESO { background:#dbeafe; color:var(--pri); } .RESUELTO { background:#dcfce7; color:var(--ok); }
+  .ALTA { color:var(--bad); font-weight:600; } .MEDIA { color:var(--warn); } .BAJA { color:var(--mut); }
+  .kpis { display:grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap:12px; }
+  .kpi { background:var(--card); border:1px solid var(--bd); border-radius:10px; padding:16px; }
+  .kpi b { display:block; font-size:28px; margin-top:4px; }
+  .kpi span { font-size:13px; color:var(--mut); }
+  .bar { height:10px; background:var(--pri); border-radius:4px; }
+  .msg { padding:10px 12px; border-radius:6px; margin-top:12px; font-size:14px; display:none; }
+  .msg.ok { background:#dcfce7; color:var(--ok); display:block; } .msg.err { background:#fee2e2; color:var(--bad); display:block; }
+  .mut { color:var(--mut); font-size:13px; }
+  .vista { display:none; } .vista.on { display:block; }
+  .cfg { margin-left:auto; display:flex; gap:6px; align-items:center; }
+  .cfg input { width:320px; padding:5px 8px; font-size:12px; background:#1f2937; color:#fff; border-color:#374151; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Mesa de Soporte TI</h1>
+  <nav>
+    <button data-v="usuario" class="on">Usuario</button>
+    <button data-v="agente">Agente</button>
+    <button data-v="jefe">Jefe</button>
+  </nav>
+  <div class="cfg"><input id="api" placeholder="URL de la API (Output ApiUrl)" title="URL de la API"></div>
+</header>
+
+<main>
+  <!-- ================= USUARIO (HU-01, HU-05) ================= -->
+  <section id="usuario" class="vista on">
+    <div class="card">
+      <h2>Reportar un incidente</h2>
+      <div class="row">
+        <div><label>Tu correo</label><input id="u-email" type="email" placeholder="tu.correo@empresa.com"></div>
+        <div><label>Tu nombre</label><input id="u-nombre"></div>
+        <div><label>Categoría</label><select id="u-cat"><option>HARDWARE</option><option>SOFTWARE</option><option>RED</option><option>ACCESOS</option><option>OTRO</option></select></div>
+        <div><label>Prioridad</label><select id="u-prio"><option>BAJA</option><option selected>MEDIA</option><option>ALTA</option></select></div>
+      </div>
+      <label>Título</label><input id="u-titulo" maxlength="120">
+      <label>Describe el problema</label><textarea id="u-desc"></textarea>
+      <button class="btn" onclick="crearTicket()">Enviar ticket</button>
+      <div id="u-msg" class="msg"></div>
+      <p class="mut">La primera vez recibirás un correo de AWS para confirmar la suscripción: confírmalo para recibir avisos cuando tu ticket cambie de estado.</p>
+    </div>
+    <div class="card">
+      <h2>Mis tickets <button class="btn sec sm" onclick="misTickets()">Actualizar</button></h2>
+      <div id="u-lista" class="mut">Escribe tu correo arriba y pulsa Actualizar.</div>
+    </div>
+  </section>
+
+  <!-- ================= AGENTE (HU-02, HU-03) ================= -->
+  <section id="agente" class="vista">
+    <div class="card">
+      <div class="row"><div><label>Soy el agente</label><input id="a-nombre" placeholder="ej. diana"></div></div>
+      <button class="btn sec" onclick="cargarAgente()">Actualizar</button>
+      <div id="a-msg" class="msg"></div>
+    </div>
+    <div class="card"><h2>Cola de pendientes (el más antiguo primero)</h2><div id="a-cola"></div></div>
+    <div class="card"><h2>Mis tickets en proceso</h2><div id="a-mios"></div></div>
+  </section>
+
+  <!-- ================= JEFE (HU-04 + SLA) ================= -->
+  <section id="jefe" class="vista">
+    <div class="kpis" id="j-kpis"></div>
+    <div class="card" style="margin-top:18px"><h2>Tickets por agente</h2><div id="j-agentes"></div></div>
+    <div class="card"><h2>Fuera de SLA (pendientes sin atención)</h2><div id="j-sla"></div></div>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const params = new URLSearchParams(location.search);
+let API = params.get('api') || (window.APP_CONFIG && window.APP_CONFIG.apiUrl) || '';
+try { API = API || localStorage.getItem('apiUrl') || ''; } catch (e) {}
+$('api').value = API;
+$('api').addEventListener('change', e => { API = e.target.value.trim().replace(/\/$/, ''); try { localStorage.setItem('apiUrl', API); } catch (e) {} });
+
+document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
+  document.querySelectorAll('nav button').forEach(x => x.classList.toggle('on', x === b));
+  document.querySelectorAll('.vista').forEach(v => v.classList.toggle('on', v.id === b.dataset.v));
+  if (b.dataset.v === 'jefe') cargarJefe();
+  if (b.dataset.v === 'agente' && $('a-nombre').value) cargarAgente();
+});
+
+async function api(path, opts = {}) {
+  if (!API) throw new Error('Configura la URL de la API arriba a la derecha');
+  const r = await fetch(API + path, { ...opts, headers: { 'content-type': 'application/json' } });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || ('Error ' + r.status));
+  return data;
+}
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const fecha = s => s ? new Date(s).toLocaleString('es-CO', { dateStyle: 'short', timeStyle: 'short' }) : '—';
+const hace = s => { const h = (Date.now() - new Date(s)) / 36e5; return h < 1 ? Math.round(h * 60) + ' min' : h < 48 ? h.toFixed(1) + ' h' : (h / 24).toFixed(1) + ' d'; };
+const pill = e => `<span class="pill ${e}">${e.replace('_', ' ')}</span>`;
+const msg = (el, txt, ok) => { $(el).textContent = txt; $(el).className = 'msg ' + (ok ? 'ok' : 'err'); };
+
+// ---- Usuario ----
+async function crearTicket() {
+  try {
+    const t0 = Date.now();
+    const r = await api('/tickets', { method: 'POST', body: JSON.stringify({
+      email: $('u-email').value, nombre: $('u-nombre').value, categoria: $('u-cat').value,
+      prioridad: $('u-prio').value, titulo: $('u-titulo').value, descripcion: $('u-desc').value }) });
+    msg('u-msg', `Ticket ${r.ticketId} recibido y en cola. Aparecerá en "Mis tickets" en unos segundos.`, true);
+    $('u-titulo').value = ''; $('u-desc').value = '';
+    esperarTicket(r.ticketId, 6, t0);
+  } catch (e) { msg('u-msg', e.message, false); }
+}
+// El ticket entra por la cola: se consulta cada 2,5 s hasta que el worker lo guarde
+async function esperarTicket(id, intentos, t0) {
+  const lista = await misTickets();
+  if ((lista || []).some(x => x.ticketId === id)) {
+    const seg = Math.max(1, Math.ceil((Date.now() - t0) / 1000));
+    return msg('u-msg', `Ticket ${id} guardado: pasó por la cola y quedó registrado en menos de ${seg} s.`, true);
+  }
+  if (intentos > 0) setTimeout(() => esperarTicket(id, intentos - 1, t0), 2500);
+}
+async function misTickets() {
+  const email = $('u-email').value.trim();
+  if (!email) return;
+  try {
+    const t = await api('/tickets?email=' + encodeURIComponent(email));
+    $('u-lista').innerHTML = !t.length ? 'No tienes tickets.' : `<table><tr><th>Ticket</th><th>Título</th><th>Estado</th><th>Agente</th><th>Creado</th><th>Solución</th></tr>
+      ${t.map(x => `<tr><td>${esc(x.ticketId)}</td><td>${esc(x.titulo)}</td><td>${pill(x.estado)}</td><td>${esc(x.agente || '—')}</td><td>${fecha(x.creadoEn)}</td><td>${esc(x.solucion || '')}</td></tr>`).join('')}</table>`;
+    return t;
+  } catch (e) { $('u-lista').textContent = e.message; }
+}
+
+// ---- Agente ----
+async function cargarAgente() {
+  const yo = $('a-nombre').value.trim().toLowerCase();
+  if (!yo) return msg('a-msg', 'Escribe tu nombre de agente', false);
+  try {
+    const [cola, mios] = await Promise.all([api('/tickets?estado=PENDIENTE'), api('/tickets?estado=EN_PROCESO&agente=' + encodeURIComponent(yo))]);
+    $('a-cola').innerHTML = !cola.length ? '<p class="mut">No hay tickets pendientes 🎉</p>' : `<table><tr><th>#</th><th>Ticket</th><th>Prioridad</th><th>Título</th><th>Usuario</th><th>Esperando</th><th></th></tr>
+      ${cola.map((x, i) => `<tr><td>${i + 1}</td><td>${esc(x.ticketId)}</td><td class="${x.prioridad}">${x.prioridad}</td><td><b>${esc(x.titulo)}</b><br><span class="mut">${esc(x.descripcion)}</span></td><td>${esc(x.email)}</td><td>${hace(x.creadoEn)}</td>
+      <td><button class="btn sm" onclick="tomar('${esc(x.ticketId)}')">Tomar</button></td></tr>`).join('')}</table>`;
+    $('a-mios').innerHTML = !mios.length ? '<p class="mut">No tienes tickets en proceso.</p>' : `<table><tr><th>Ticket</th><th>Título</th><th>Tomado</th><th>Solución</th><th></th></tr>
+      ${mios.map(x => `<tr><td>${esc(x.ticketId)}</td><td><b>${esc(x.titulo)}</b><br><span class="mut">${esc(x.descripcion)}</span></td><td>${fecha(x.tomadoEn)}</td>
+      <td><input id="sol-${esc(x.ticketId)}" placeholder="¿Qué hiciste?"></td><td><button class="btn sm" onclick="resolver('${esc(x.ticketId)}')">Resolver</button></td></tr>`).join('')}</table>`;
+  } catch (e) { msg('a-msg', e.message, false); }
+}
+async function tomar(id) {
+  try { await api('/tickets/' + id, { method: 'PATCH', body: JSON.stringify({ accion: 'tomar', agente: $('a-nombre').value }) });
+    msg('a-msg', `Tomaste ${id}`, true); } catch (e) { msg('a-msg', e.message, false); }
+  cargarAgente();
+}
+async function resolver(id) {
+  try { await api('/tickets/' + id, { method: 'PATCH', body: JSON.stringify({ accion: 'resolver', agente: $('a-nombre').value, solucion: $('sol-' + id).value }) });
+    msg('a-msg', `${id} resuelto. El usuario será notificado.`, true); } catch (e) { msg('a-msg', e.message, false); }
+  cargarAgente();
+}
+
+// ---- Jefe ----
+async function cargarJefe() {
+  try {
+    const m = await api('/metricas'); const e = m.porEstado || {};
+    const k = (t, v, s) => `<div class="kpi"><span>${t}</span><b>${v}</b><span>${s || ''}</span></div>`;
+    $('j-kpis').innerHTML = k('Tickets totales', m.total) + k('Pendientes', e.PENDIENTE || 0) + k('En proceso', e.EN_PROCESO || 0) + k('Resueltos', e.RESUELTO || 0)
+      + k('Espera promedio', m.horasPromEspera ?? '—', 'horas hasta que un agente lo toma') + k('Resolución promedio', m.horasPromResolucion ?? '—', 'horas desde creación hasta resuelto')
+      + k('Fuera de SLA', m.slaVencidos.length, `pendientes > ${m.slaHoras} h`);
+    const max = Math.max(1, ...m.porAgente.map(a => a.asignados));
+    $('j-agentes').innerHTML = !m.porAgente.length ? '<p class="mut">Sin datos</p>' : `<table><tr><th>Agente</th><th style="width:40%">Asignados</th><th>Resueltos</th><th>Horas prom. resolución</th></tr>
+      ${m.porAgente.map(a => `<tr><td>${esc(a.agente)}</td><td><div class="bar" style="width:${a.asignados / max * 100}%"></div> ${a.asignados}</td><td>${a.resueltos}</td><td>${a.horasPromResolucion ?? '—'}</td></tr>`).join('')}</table>`;
+    $('j-sla').innerHTML = !m.slaVencidos.length ? '<p class="mut">Todo dentro del SLA ✅</p>' : `<table><tr><th>Ticket</th><th>Prioridad</th><th>Título</th><th>Esperando</th></tr>
+      ${m.slaVencidos.map(x => `<tr><td>${esc(x.ticketId)}</td><td class="${x.prioridad}">${x.prioridad}</td><td>${esc(x.titulo)}</td><td class="ALTA">${hace(x.creadoEn)}</td></tr>`).join('')}</table>`;
+  } catch (e) { $('j-kpis').innerHTML = `<div class="msg err">${esc(e.message)}</div>`; }
+}
+</script>
+</body>
+</html>

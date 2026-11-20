@@ -1,0 +1,48 @@
+# Integracion continua: corre en cada pull request y en cada cambio a main.
+# Si algo falla aqui, el cambio no deberia fusionarse.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  plantillas:
+    name: CloudFormation (cfn-lint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install cfn-lint
+      # Muestra errores y advertencias; solo los errores hacen fallar el trabajo
+      - run: cfn-lint --non-zero-exit-code error iac/*.yaml
+
+  pruebas:
+    name: Pruebas (historias de usuario + auditoria de permisos)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install pyyaml
+      - run: python -m unittest discover -s tests -v
+
+  docker:
+    name: Imagen Docker (construir y arrancar)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -f app/Dockerfile -t soporte-ti .
+      - name: Arrancar el contenedor y comprobar que responde
+        run: |
+          docker run -d --name soporte-ti -p 8080:8080 soporte-ti
+          for i in $(seq 1 20); do curl -fs http://localhost:8080/salud && break; sleep 1; done
+          ./scripts/demo.sh http://localhost:8080
+          docker logs soporte-ti

@@ -1,0 +1,71 @@
+# Despliegue continuo: cada cambio que llega a main se despliega solo en AWS.
+#
+# Configuracion (Settings -> Secrets and variables -> Actions):
+#   Secrets:   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY y, en AWS Academy, AWS_SESSION_TOKEN
+#   Variables: EQUIPO, EMAIL_JEFE y, opcionales, AWS_REGION (us-east-1) y ROL_EXISTENTE (LabRole)
+# Mientras falten, el flujo termina en verde con un aviso y no despliega nada.
+name: CD
+
+on:
+  push:
+    branches: [main]
+    paths: ['iac/main.yaml', 'frontend/**', 'scripts/deploy.sh', '.github/workflows/cd.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: despliegue
+  cancel-in-progress: false
+
+jobs:
+  desplegar:
+    name: Desplegar en AWS
+    runs-on: ubuntu-latest
+    env:
+      EQUIPO: ${{ vars.EQUIPO }}
+      EMAIL_JEFE: ${{ vars.EMAIL_JEFE }}
+      ROL_EXISTENTE: ${{ vars.ROL_EXISTENTE }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Revisar que la configuracion este completa
+        id: config
+        env:
+          CLAVE: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        run: |
+          if [ -z "$CLAVE" ] || [ -z "$EQUIPO" ] || [ -z "$EMAIL_JEFE" ]; then
+            echo "::warning::Faltan secretos o variables (ver el encabezado de cd.yml). No se despliega."
+            echo "lista=no" >> "$GITHUB_OUTPUT"
+          else
+            echo "lista=si" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-python@v5
+        if: steps.config.outputs.lista == 'si'
+        with:
+          python-version: '3.12'
+
+      - name: Probar antes de desplegar
+        if: steps.config.outputs.lista == 'si'
+        run: pip install pyyaml && python -m unittest discover -s tests
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        if: steps.config.outputs.lista == 'si'
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - name: Desplegar la infraestructura y la pagina
+        if: steps.config.outputs.lista == 'si'
+        run: ./scripts/deploy.sh "$EQUIPO" "$EMAIL_JEFE" $ROL_EXISTENTE
+
+      - name: Prueba de extremo a extremo contra lo desplegado
+        if: steps.config.outputs.lista == 'si'
+        run: |
+          API=$(aws cloudformation describe-stacks --stack-name "gtn-$EQUIPO" \
+            --query "Stacks[0].Outputs[?OutputKey=='ApiUrl'].OutputValue" --output text)
+          ./scripts/demo.sh "$API"

@@ -1,2 +1,5 @@
 # Evidencias
-Aquí van las evidencias de laboratorios (lab01–lab06) e hitos: capturas (PNG con nombre claro, p.ej. `lab05-stack-create.png`) y notas. El video de respaldo de la sustentación (2 min) también vive aquí.
+
+Capturas de laboratorios e hitos, con nombre claro (por ejemplo `hito2-instancia-ec2.png`, `hito4-jenkins-ok.png`, `hito5-cost-explorer.png`).
+
+Las capturas de la aplicacion funcionando estan en [`docs/img/`](../docs/img/) y los resultados de las pruebas en [`docs/pruebas.md`](../docs/pruebas.md).
